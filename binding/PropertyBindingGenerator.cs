@@ -46,7 +46,7 @@ public class PropertyBindingGenerator : IIncrementalGenerator
                     var fieldName = field.Name;                  
                     var typeName = field.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
                     var propName = ToPascal(fieldName);         
-                    var backing = fieldName.StartsWith("_") ? fieldName : "_" + fieldName; // keep original
+                    var backing = fieldName.StartsWith("_") ? fieldName : "_" + fieldName;
 
                     sb.AppendLine($"     public {typeName} {propName}");
                     sb.AppendLine("     {");
