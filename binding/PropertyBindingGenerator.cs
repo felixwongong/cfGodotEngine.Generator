@@ -38,24 +38,67 @@ public class PropertyBindingGenerator : IIncrementalGenerator
 
                 var sb = new StringBuilder();
                 GenerateClassHeader(sb);
-                sb.AppendLine("     private readonly global::cfEngine.DataStructure.PropertyMap bindingMap = new();");
-                sb.AppendLine("     public global::cfEngine.DataStructure.IPropertyMap GetBindings => bindingMap;");
+                
+                // Solution 1: Lazy PropertyMap allocation
+                sb.AppendLine("     private global::cfEngine.DataStructure.PropertyMap _bindingMap;");
+                sb.AppendLine("     private bool _hasBindings;");
+                sb.AppendLine();
+                sb.AppendLine("     public global::cfEngine.DataStructure.IPropertyMap GetBindings");
+                sb.AppendLine("     {");
+                sb.AppendLine("         get");
+                sb.AppendLine("         {");
+                sb.AppendLine("             if (_bindingMap == null && _hasBindings)");
+                sb.AppendLine("             {");
+                sb.AppendLine("                 _bindingMap = new global::cfEngine.DataStructure.PropertyMap();");
+                sb.AppendLine("             }");
+                sb.AppendLine("             return _bindingMap;");
+                sb.AppendLine("         }");
+                sb.AppendLine("     }");
+                sb.AppendLine();
+                sb.AppendLine("     public void __EnableBindings() => _hasBindings = true;");
 
                 foreach (var (field, attribute) in group)
                 {
-                    var fieldName = field.Name;                  
+                    var fieldName = field.Name;
+                    
+                    // Solution 2: Enforce naming convention - field must start with underscore
+                    if (!fieldName.StartsWith("_"))
+                    {
+                        var descriptor = new DiagnosticDescriptor(
+                            id: "BIND001",
+                            title: "PropertyBinding field must start with underscore",
+                            messageFormat: "Field '{0}' with [PropertyBinding] attribute must use '_camelCase' naming (e.g., '_{1}')",
+                            category: "Binding",
+                            DiagnosticSeverity.Error,
+                            isEnabledByDefault: true,
+                            description: "Fields marked with [PropertyBinding] must follow C# naming conventions with underscore prefix to avoid conflicts with generated properties."
+                        );
+                        
+                        var diagnostic = Diagnostic.Create(
+                            descriptor,
+                            field.Locations.FirstOrDefault(),
+                            fieldName,
+                            fieldName.Length > 0 ? char.ToLower(fieldName[0]) + fieldName.Substring(1) : fieldName
+                        );
+                        
+                        spc.ReportDiagnostic(diagnostic);
+                        continue; // Skip generation for this field
                     var typeName = field.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-                    var propName = ToPascal(fieldName);         
-                    var backing = fieldName.StartsWith("_") ? fieldName : "_" + fieldName;
+                    var propName = ToPascal(fieldName);
 
                     sb.AppendLine($"     public {typeName} {propName}");
                     sb.AppendLine("     {");
-                    sb.AppendLine($"         get => {backing};");
+                    sb.AppendLine($"         get => {fieldName};");
                     sb.AppendLine("         set");
                     sb.AppendLine("         {");
-                    sb.AppendLine($"             var __old = {backing};");
-                    sb.AppendLine($"             {backing} = value;");
-                    sb.AppendLine($"             bindingMap.Set(BindingKey.{propName}, value);");
+                    sb.AppendLine($"             if (global::System.Collections.Generic.EqualityComparer<{typeName}>.Default.Equals({fieldName}, value)) return;");
+                    sb.AppendLine($"             {fieldName} = value;");
+                    sb.AppendLine();
+                    sb.AppendLine("             // Only use PropertyMap if bindings are enabled");
+                    sb.AppendLine("             if (_hasBindings && _bindingMap != null)");
+                    sb.AppendLine("             {");
+                    sb.AppendLine($"                 _bindingMap.Set(BindingKey.{propName}, value);");
+                    sb.AppendLine("             }");
                     sb.AppendLine("         }");
                     sb.AppendLine("     }");
                     sb.AppendLine();
