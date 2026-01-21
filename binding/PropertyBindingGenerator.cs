@@ -31,6 +31,7 @@ public class PropertyBindingGenerator : IIncrementalGenerator
             foreach (var group in fields.GroupBy(f => f.field.ContainingType, SymbolEqualityComparer.Default))
             {
                 var type = group.Key as INamedTypeSymbol;
+                if (type == null) continue;
                 
                 var ns = type.ContainingNamespace.IsGlobalNamespace ? null : type.ContainingNamespace.ToDisplayString();
                 var className = type.Name;
@@ -83,6 +84,8 @@ public class PropertyBindingGenerator : IIncrementalGenerator
                         
                         spc.ReportDiagnostic(diagnostic);
                         continue; // Skip generation for this field
+                    }
+                    
                     var typeName = field.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
                     var propName = ToPascal(fieldName);
 
