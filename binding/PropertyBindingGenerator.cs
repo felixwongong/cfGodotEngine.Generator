@@ -181,7 +181,7 @@ public class PropertyBindingGenerator : IIncrementalGenerator
             {
                 foreach (var (field, _, propName) in fields)
                 {
-                    sb.AppendLine($"                case nameof(_owner.{field.Name}):");
+                    sb.AppendLine($"                case \"{propName}\":");
                     sb.AppendLine($"                    value = _owner.{field.Name};");
                     sb.AppendLine("                    return true;");
                 }
@@ -206,7 +206,7 @@ public class PropertyBindingGenerator : IIncrementalGenerator
             foreach (var (field, _, propName) in objectFields)
             {
                 var fieldType = field.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-                sb.AppendLine($"                case nameof(_owner.{field.Name}):");
+                sb.AppendLine($"                case \"{propName}\":");
                 sb.AppendLine($"                    if (typeof(T) == typeof({fieldType}))");
                 sb.AppendLine("                    {");
                 sb.AppendLine($"                        value = (T)(object)_owner.{field.Name};");
@@ -326,7 +326,7 @@ public class PropertyBindingGenerator : IIncrementalGenerator
             sb.AppendLine("        // Only dispatch property name (receiver retrieves value via Get<T>)");
             sb.AppendLine("        if (_properties?._propertyChangedRelay != null)");
             sb.AppendLine("        {");
-            sb.AppendLine($"            _properties._propertyChangedRelay.Dispatch(nameof({fieldName}));");
+            sb.AppendLine($"            _properties._propertyChangedRelay.Dispatch(\"{propName}\");");
             sb.AppendLine("        }");
             sb.AppendLine("    }");
             sb.AppendLine();
