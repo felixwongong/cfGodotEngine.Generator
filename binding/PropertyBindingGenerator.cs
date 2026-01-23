@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace cfGodotEngine.Binding;
@@ -15,21 +16,21 @@ public class PropertyBindingGenerator : IIncrementalGenerator
     {
         var matched = context.SyntaxProvider.ForAttributeWithMetadataName(
             AttrMeta,
-            static (node, _) => node is VariableDeclaratorSyntax,
+            static (node, _) => node is VariableDeclaratorSyntax || node is PropertyDeclarationSyntax,
             static (ctx, _) =>
             {
-                var field = (IFieldSymbol)ctx.TargetSymbol;
-                var attribute = field.GetAttributes().FirstOrDefault(a => a.AttributeClass?.ToDisplayString() == AttrMeta);
-                return (field, attribute);
+                var symbol = ctx.TargetSymbol;
+                var attribute = symbol.GetAttributes().FirstOrDefault(a => a.AttributeClass?.ToDisplayString() == AttrMeta);
+                return (symbol, attribute);
             });
 
         var grouped = matched.Collect();
 
-        context.RegisterSourceOutput(grouped, (spc, fields) =>
+        context.RegisterSourceOutput(grouped, (spc, members) =>
         {
-            if (fields.IsDefaultOrEmpty) return;
+            if (members.IsDefaultOrEmpty) return;
 
-            foreach (var group in fields.GroupBy(f => f.field.ContainingType, SymbolEqualityComparer.Default))
+            foreach (var group in members.GroupBy(m => m.symbol.ContainingType, SymbolEqualityComparer.Default))
             {
                 var type = group.Key as INamedTypeSymbol;
                 if (type == null) continue;
@@ -38,16 +39,27 @@ public class PropertyBindingGenerator : IIncrementalGenerator
                 var className = type.Name;
                 var typeMods = GetTypeModifiers(type);
 
-                // Group fields by type for efficient switch generation
-                var fieldsByType = new Dictionary<string, List<(IFieldSymbol field, AttributeData attribute, string propName)>>();
-                var validFields = new List<(IFieldSymbol field, AttributeData attribute, string propName)>();
+                // Group members by type for efficient switch generation
+                var membersByType = new Dictionary<string, List<(ISymbol symbol, AttributeData attribute, string propName)>>();
+                var validMembers = new List<(ISymbol symbol, AttributeData attribute, string propName)>();
+                
+                // Track property dependencies: field -> list of dependent properties
+                var propertyDependencies = new Dictionary<string, List<string>>();
 
-                foreach (var (field, attribute) in group)
+                foreach (var (symbol, attribute) in group)
                 {
-                    var fieldName = field.Name;
+                    var memberName = symbol.Name;
+                    var memberType = symbol switch
+                    {
+                        IFieldSymbol field => field.Type,
+                        IPropertySymbol prop => prop.Type,
+                        _ => null
+                    };
                     
-                    // Enforce naming convention - field must start with underscore
-                    if (!fieldName.StartsWith("_"))
+                    if (memberType == null) continue;
+                    
+                    // For fields, enforce naming convention - field must start with underscore
+                    if (symbol is IFieldSymbol && !memberName.StartsWith("_"))
                     {
                         var descriptor = new DiagnosticDescriptor(
                             id: "BIND001",
@@ -61,41 +73,71 @@ public class PropertyBindingGenerator : IIncrementalGenerator
                         
                         var diagnostic = Diagnostic.Create(
                             descriptor,
-                            field.Locations.FirstOrDefault(),
-                            fieldName,
-                            fieldName.Length > 0 ? char.ToLower(fieldName[0]) + fieldName.Substring(1) : fieldName
+                            symbol.Locations.FirstOrDefault(),
+                            memberName,
+                            memberName.Length > 0 ? char.ToLower(memberName[0]) + memberName.Substring(1) : memberName
                         );
                         
                         spc.ReportDiagnostic(diagnostic);
                         continue;
                     }
 
-                    var propName = ToPascal(fieldName);
-                    var typeKey = GetTypeKey(field.Type);
+                    // For properties starting with underscore, convert to PascalCase; otherwise use as-is
+                    // For fields, always convert to PascalCase
+                    var propName = symbol switch
+                    {
+                        IPropertySymbol when memberName.StartsWith("_") => ToPascal(memberName),
+                        IPropertySymbol => memberName,
+                        _ => ToPascal(memberName)
+                    };
+                    var typeKey = GetTypeKey(memberType);
                     
-                    if (!fieldsByType.ContainsKey(typeKey))
-                        fieldsByType[typeKey] = new List<(IFieldSymbol, AttributeData, string)>();
+                    if (!membersByType.ContainsKey(typeKey))
+                        membersByType[typeKey] = new List<(ISymbol, AttributeData, string)>();
                     
-                    fieldsByType[typeKey].Add((field, attribute, propName));
-                    validFields.Add((field, attribute, propName));
+                    // Analyze property dependencies
+                    if (symbol is IPropertySymbol property)
+                    {
+                        var declaringSyntax = property.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax();
+                        if (declaringSyntax is PropertyDeclarationSyntax propertySyntax)
+                        {
+                            var identifiers = propertySyntax.DescendantNodes()
+                                .OfType<IdentifierNameSyntax>()
+                                .Select(id => id.Identifier.ValueText)
+                                .Where(name => name.StartsWith("_"))
+                                .Distinct()
+                                .ToList();
+                            
+                            foreach (var fieldName in identifiers)
+                            {
+                                if (!propertyDependencies.ContainsKey(fieldName))
+                                    propertyDependencies[fieldName] = new List<string>();
+                                
+                                propertyDependencies[fieldName].Add(propName);
+                            }
+                        }
+                    }
+                    
+                    membersByType[typeKey].Add((symbol, attribute, propName));
+                    validMembers.Add((symbol, attribute, propName));
                 }
 
-                if (validFields.Count == 0) continue;
+                if (validMembers.Count == 0) continue;
 
                 var sb = new StringBuilder();
                 
                 // Generate Properties class
-                GeneratePropertiesClass(sb, ns, className, type, validFields, fieldsByType);
+                GeneratePropertiesClass(sb, ns, className, type, validMembers, membersByType, propertyDependencies);
                 spc.AddSource($"{className}.Properties.generated.cs", sb.ToString());
 
                 // Generate main class partial
                 sb.Clear();
-                GenerateMainClassPartial(sb, ns, className, typeMods, validFields);
+                GenerateMainClassPartial(sb, ns, className, typeMods, validMembers);
                 spc.AddSource($"{className}.Binding.generated.cs", sb.ToString());
 
                 // Generate BindingKey class
                 sb.Clear();
-                GenerateBindingKeyClass(sb, ns, className, typeMods, validFields);
+                GenerateBindingKeyClass(sb, ns, className, typeMods, validMembers);
                 spc.AddSource($"{className}.BindingKey.generated.cs", sb.ToString());
             }
         });
@@ -106,8 +148,9 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         string ns,
         string className,
         INamedTypeSymbol type,
-        List<(IFieldSymbol field, AttributeData attribute, string propName)> validFields,
-        Dictionary<string, List<(IFieldSymbol field, AttributeData attribute, string propName)>> fieldsByType)
+        List<(ISymbol symbol, AttributeData attribute, string propName)> validMembers,
+        Dictionary<string, List<(ISymbol symbol, AttributeData attribute, string propName)>> membersByType,
+        Dictionary<string, List<string>> propertyDependencies)
     {
         sb.AppendLine("// <auto-generated />");
         sb.AppendLine($"namespace {ns};");
@@ -118,6 +161,13 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         sb.AppendLine("    {");
         sb.AppendLine($"        private {className} _owner;");
         sb.AppendLine("        internal global::cfEngine.Rx.Relay<string> _propertyChangedRelay;");
+        
+        // Add subscription field if there are dependencies
+        if (propertyDependencies.Count > 0)
+        {
+            sb.AppendLine("        private global::cfEngine.Rx.Subscription _dependencySubscription;");
+        }
+        
         sb.AppendLine();
         sb.AppendLine("        public global::cfEngine.Rx.IRelay<string> propertyChangedRelay");
         sb.AppendLine("        {");
@@ -129,14 +179,30 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         sb.AppendLine("            }");
         sb.AppendLine("        }");
         sb.AppendLine();
-        sb.AppendLine($"        public {className}_Properties({className} owner) => _owner = owner;");
+        sb.AppendLine($"        public {className}_Properties({className} owner)");
+        sb.AppendLine("        {");
+        sb.AppendLine("            _owner = owner;");
+        
+        // Register dependency dispatcher if there are any dependencies
+        if (propertyDependencies.Count > 0)
+        {
+            sb.AppendLine("            _dependencySubscription = propertyChangedRelay.AddListener(_DispatchDependentProperties);");
+        }
+        
+        sb.AppendLine("        }");
         sb.AppendLine();
+        
+        // Generate dependency dispatcher method
+        if (propertyDependencies.Count > 0)
+        {
+            GenerateDependencyDispatcher(sb, propertyDependencies, validMembers);
+        }
 
         // Generate type-specific getter methods
-        GenerateTypeSpecificGetters(sb, fieldsByType, type);
+        GenerateTypeSpecificGetters(sb, membersByType, type);
 
         // Generate generic Get<T> method
-        GenerateGenericGet(sb, fieldsByType);
+        GenerateGenericGet(sb, membersByType);
 
         // Generate RegisterPropertyChange and UnregisterPropertyChange
         sb.AppendLine("        public void RegisterPropertyChange(global::System.Action<string> callback)");
@@ -153,9 +219,48 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         sb.AppendLine("}");
     }
 
+    private static void GenerateDependencyDispatcher(
+        StringBuilder sb,
+        Dictionary<string, List<string>> propertyDependencies,
+        List<(ISymbol symbol, AttributeData attribute, string propName)> validMembers)
+    {
+        sb.AppendLine("        private void _DispatchDependentProperties(string propertyName)");
+        sb.AppendLine("        {");
+        sb.AppendLine("            switch (propertyName)");
+        sb.AppendLine("            {");
+        
+        // Build a map of field propName -> field symbol name for the switch
+        var fieldPropNameToSymbolName = validMembers
+            .Where(m => m.symbol is IFieldSymbol)
+            .ToDictionary(m => m.propName, m => m.symbol.Name);
+        
+        foreach (var kvp in propertyDependencies)
+        {
+            var fieldSymbolName = kvp.Key;
+            var dependentProperties = kvp.Value;
+            
+            // Find the propName for this field
+            var fieldPropName = fieldPropNameToSymbolName
+                .FirstOrDefault(x => x.Value == fieldSymbolName).Key;
+            
+            if (fieldPropName == null) continue;
+            
+            sb.AppendLine($"                case \"{fieldPropName}\":");
+            foreach (var dependentProp in dependentProperties)
+            {
+                sb.AppendLine($"                    _propertyChangedRelay.Dispatch(\"{dependentProp}\");");
+            }
+            sb.AppendLine("                    break;");
+        }
+        
+        sb.AppendLine("            }");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+    }
+
     private static void GenerateTypeSpecificGetters(
         StringBuilder sb,
-        Dictionary<string, List<(IFieldSymbol field, AttributeData attribute, string propName)>> fieldsByType,
+        Dictionary<string, List<(ISymbol symbol, AttributeData attribute, string propName)>> membersByType,
         INamedTypeSymbol type)
     {
         var typeMap = new Dictionary<string, string>
@@ -177,12 +282,12 @@ public class PropertyBindingGenerator : IIncrementalGenerator
             sb.AppendLine("            switch (key)");
             sb.AppendLine("            {");
 
-            if (fieldsByType.TryGetValue(typeKey, out var fields))
+            if (membersByType.TryGetValue(typeKey, out var members))
             {
-                foreach (var (field, _, propName) in fields)
+                foreach (var (symbol, _, propName) in members)
                 {
-                    sb.AppendLine($"                case \"{propName}\":");
-                    sb.AppendLine($"                    value = _owner.{field.Name};");
+                    sb.AppendLine($"                case \"{propName}\": ");
+                    sb.AppendLine($"                    value = _owner.{symbol.Name};");
                     sb.AppendLine("                    return true;");
                 }
             }
@@ -201,15 +306,24 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         sb.AppendLine("            switch (key)");
         sb.AppendLine("            {");
 
-        if (fieldsByType.TryGetValue("object", out var objectFields))
+        if (membersByType.TryGetValue("object", out var objectMembers))
         {
-            foreach (var (field, _, propName) in objectFields)
+            foreach (var (symbol, _, propName) in objectMembers)
             {
-                var fieldType = field.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+                var memberType = symbol switch
+                {
+                    IFieldSymbol field => field.Type,
+                    IPropertySymbol property => property.Type,
+                    _ => null
+                };
+                
+                if (memberType == null) continue;
+                
+                var typeStr = memberType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
                 sb.AppendLine($"                case \"{propName}\":");
-                sb.AppendLine($"                    if (typeof(T) == typeof({fieldType}))");
+                sb.AppendLine($"                    if (typeof(T) == typeof({typeStr}))");
                 sb.AppendLine("                    {");
-                sb.AppendLine($"                        value = (T)(object)_owner.{field.Name};");
+                sb.AppendLine($"                        value = (T)(object)_owner.{symbol.Name};");
                 sb.AppendLine("                        return true;");
                 sb.AppendLine("                    }");
                 sb.AppendLine("                    break;");
@@ -225,9 +339,9 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         sb.AppendLine();
     }
 
-    private static void GenerateGenericGet(StringBuilder sb, Dictionary<string, List<(IFieldSymbol field, AttributeData attribute, string propName)>> fieldsByType)
+    private static void GenerateGenericGet(StringBuilder sb, Dictionary<string, List<(ISymbol symbol, AttributeData attribute, string propName)>> membersByType)
     {
-        sb.AppendLine("        public bool Get<T>(string key, out T? value)");
+        sb.AppendLine("        public bool Get<T>(string key, out T value)");
         sb.AppendLine("        {");
         
         var typeChecks = new[]
@@ -273,7 +387,7 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         string ns,
         string className,
         string typeMods,
-        List<(IFieldSymbol field, AttributeData attribute, string propName)> validFields)
+        List<(ISymbol symbol, AttributeData attribute, string propName)> validMembers)
     {
         sb.AppendLine("// <auto-generated />");
         sb.AppendLine($"namespace {ns};");
@@ -293,9 +407,13 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         sb.AppendLine("    }");
         sb.AppendLine();
 
-        // Generate setter methods
-        foreach (var (field, attribute, propName) in validFields)
+        // Generate setter methods (only for fields, not properties)
+        foreach (var (symbol, attribute, propName) in validMembers)
         {
+            // Skip properties - they manage their own setters
+            if (symbol is not IFieldSymbol field)
+                continue;
+                
             var typeName = field.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
             var fieldName = field.Name;
             
@@ -340,7 +458,7 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         string ns,
         string className,
         string typeMods,
-        List<(IFieldSymbol field, AttributeData attribute, string propName)> validFields)
+        List<(ISymbol symbol, AttributeData attribute, string propName)> validMembers)
     {
         sb.AppendLine("// <auto-generated />");
         sb.AppendLine($"namespace {ns};");
@@ -350,7 +468,7 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         sb.AppendLine("    public static class BindingKey");
         sb.AppendLine("    {");
 
-        foreach (var (field, _, propName) in validFields)
+        foreach (var (symbol, _, propName) in validMembers)
         {
             sb.AppendLine($"        public const string {propName} = nameof({propName});");
         }
@@ -362,7 +480,7 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         sb.AppendLine("        public static void Init()");
         sb.AppendLine("        {");
         
-        foreach (var (_, _, propName) in validFields)
+        foreach (var (_, _, propName) in validMembers)
         {
             sb.AppendLine($"            keys.Add({propName});");
         }
