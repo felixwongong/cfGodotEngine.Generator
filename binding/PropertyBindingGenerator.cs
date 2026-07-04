@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -43,8 +44,13 @@ public class PropertyBindingGenerator : IIncrementalGenerator
                 var membersByType = new Dictionary<string, List<(ISymbol symbol, AttributeData attribute, string propName)>>();
                 var validMembers = new List<(ISymbol symbol, AttributeData attribute, string propName)>();
                 
-                // Track property dependencies: field -> list of dependent properties
+                // Track property dependencies: field symbol name -> list of dependent property keys
                 var propertyDependencies = new Dictionary<string, List<string>>();
+
+                // Pre-collect binding field symbol names so computed properties only depend on real binding fields
+                var bindingFieldNames = new HashSet<string>(
+                    group.Where(m => m.symbol is IFieldSymbol).Select(m => m.symbol.Name),
+                    StringComparer.Ordinal);
 
                 foreach (var (symbol, attribute) in group)
                 {
@@ -58,38 +64,32 @@ public class PropertyBindingGenerator : IIncrementalGenerator
                     
                     if (memberType == null) continue;
                     
-                    // For fields, enforce naming convention - field must start with underscore
-                    if (symbol is IFieldSymbol && !memberName.StartsWith("_"))
+                    // For fields and properties, enforce naming convention - must start with underscore
+                    if ((symbol is IFieldSymbol || symbol is IPropertySymbol) && !memberName.StartsWith("_"))
                     {
                         var descriptor = new DiagnosticDescriptor(
                             id: "BIND001",
-                            title: "PropertyBinding field must start with underscore",
-                            messageFormat: "Field '{0}' with [PropertyBinding] attribute must use '_camelCase' naming (e.g., '_{1}')",
+                            title: "PropertyBinding member must start with underscore",
+                            messageFormat: "Member '{0}' with [PropertyBinding] attribute must use '_camelCase' naming (e.g., '_{1}')",
                             category: "Binding",
                             DiagnosticSeverity.Error,
                             isEnabledByDefault: true,
-                            description: "Fields marked with [PropertyBinding] must follow C# naming conventions with underscore prefix to avoid conflicts with generated setter methods."
+                            description: "Members marked with [PropertyBinding] must follow C# naming conventions with underscore prefix to avoid conflicts with generated setter methods."
                         );
                         
                         var diagnostic = Diagnostic.Create(
                             descriptor,
                             symbol.Locations.FirstOrDefault(),
                             memberName,
-                            memberName.Length > 0 ? char.ToLower(memberName[0]) + memberName.Substring(1) : memberName
+                            memberName.Length > 0 ? "_" + char.ToLower(memberName[0]) + memberName.Substring(1) : memberName
                         );
                         
                         spc.ReportDiagnostic(diagnostic);
                         continue;
                     }
 
-                    // For properties starting with underscore, convert to PascalCase; otherwise use as-is
-                    // For fields, always convert to PascalCase
-                    var propName = symbol switch
-                    {
-                        IPropertySymbol when memberName.StartsWith("_") => ToPascal(memberName),
-                        IPropertySymbol => memberName,
-                        _ => ToPascal(memberName)
-                    };
+                    // Convert underscore-prefixed member names to PascalCase binding keys
+                    var propName = ToPascal(memberName);
                     var typeKey = GetTypeKey(memberType);
                     
                     if (!membersByType.ContainsKey(typeKey))
@@ -110,6 +110,10 @@ public class PropertyBindingGenerator : IIncrementalGenerator
                             
                             foreach (var fieldName in identifiers)
                             {
+                                // Only dispatch for real binding fields, not arbitrary underscore-prefixed identifiers
+                                if (!bindingFieldNames.Contains(fieldName))
+                                    continue;
+
                                 if (!propertyDependencies.ContainsKey(fieldName))
                                     propertyDependencies[fieldName] = new List<string>();
                                 
@@ -161,13 +165,25 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         sb.AppendLine("    {");
         sb.AppendLine($"        private {className} _owner;");
         sb.AppendLine("        internal global::cfEngine.Rx.Relay<string> _propertyChangedRelay;");
+        sb.AppendLine("        internal int _updateDepth;");
+        sb.AppendLine("        internal global::System.Collections.Generic.HashSet<string> _pendingChanges;");
         
-        // Add subscription field if there are dependencies
-        if (propertyDependencies.Count > 0)
+        // Build field symbol name -> binding key map for dependency dictionary keys
+        var fieldSymbolNameToPropName = validMembers
+            .Where(m => m.symbol is IFieldSymbol)
+            .ToDictionary(m => m.symbol.Name, m => m.propName);
+        
+        // Generate dependency lookup dictionary
+        sb.AppendLine("        private static readonly global::System.Collections.Generic.IReadOnlyDictionary<string, global::System.Collections.Generic.IReadOnlyList<string>> _dependentProperties =");
+        sb.AppendLine("            new global::System.Collections.Generic.Dictionary<string, global::System.Collections.Generic.IReadOnlyList<string>>");
+        sb.AppendLine("            {");
+        foreach (var kvp in propertyDependencies)
         {
-            sb.AppendLine("        private global::cfEngine.Rx.Subscription _dependencySubscription;");
+            if (!fieldSymbolNameToPropName.TryGetValue(kvp.Key, out var fieldPropName))
+                continue;
+            sb.AppendLine($"                {{ \"{fieldPropName}\", new[] {{ {string.Join(", ", kvp.Value.Select(dep => $"\"{dep}\""))} }} }},");
         }
-        
+        sb.AppendLine("            };");
         sb.AppendLine();
         sb.AppendLine("        public global::cfEngine.Rx.IRelay<string> propertyChangedRelay");
         sb.AppendLine("        {");
@@ -182,21 +198,44 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         sb.AppendLine($"        public {className}_Properties({className} owner)");
         sb.AppendLine("        {");
         sb.AppendLine("            _owner = owner;");
-        
-        // Register dependency dispatcher if there are any dependencies
-        if (propertyDependencies.Count > 0)
-        {
-            sb.AppendLine("            _dependencySubscription = propertyChangedRelay.AddListener(_DispatchDependentProperties);");
-        }
-        
         sb.AppendLine("        }");
         sb.AppendLine();
-        
-        // Generate dependency dispatcher method
-        if (propertyDependencies.Count > 0)
-        {
-            GenerateDependencyDispatcher(sb, propertyDependencies, validMembers);
-        }
+        sb.AppendLine("        internal void BeginUpdate() => _updateDepth++;");
+        sb.AppendLine();
+        sb.AppendLine("        internal void EndUpdate()");
+        sb.AppendLine("        {");
+        sb.AppendLine("            _updateDepth--;");
+        sb.AppendLine("            if (_updateDepth == 0 && _pendingChanges != null && _propertyChangedRelay != null)");
+        sb.AppendLine("            {");
+        sb.AppendLine("                foreach (var propertyName in _pendingChanges)");
+        sb.AppendLine("                    _propertyChangedRelay.Dispatch(propertyName);");
+        sb.AppendLine("                _pendingChanges.Clear();");
+        sb.AppendLine("            }");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+        sb.AppendLine("        internal void Dispatch(string propertyName)");
+        sb.AppendLine("        {");
+        sb.AppendLine("            if (_propertyChangedRelay == null) return;");
+        sb.AppendLine("            _propertyChangedRelay.Dispatch(propertyName);");
+        sb.AppendLine("            if (_dependentProperties.TryGetValue(propertyName, out var dependents))");
+        sb.AppendLine("            {");
+        sb.AppendLine("                foreach (var dependent in dependents)");
+        sb.AppendLine("                    _propertyChangedRelay.Dispatch(dependent);");
+        sb.AppendLine("            }");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+        sb.AppendLine("        internal void QueueChange(string propertyName)");
+        sb.AppendLine("        {");
+        sb.AppendLine("            if (_pendingChanges == null)");
+        sb.AppendLine("                _pendingChanges = new global::System.Collections.Generic.HashSet<string>();");
+        sb.AppendLine("            _pendingChanges.Add(propertyName);");
+        sb.AppendLine("            if (_dependentProperties.TryGetValue(propertyName, out var dependents))");
+        sb.AppendLine("            {");
+        sb.AppendLine("                foreach (var dependent in dependents)");
+        sb.AppendLine("                    _pendingChanges.Add(dependent);");
+        sb.AppendLine("            }");
+        sb.AppendLine("        }");
+        sb.AppendLine();
 
         // Generate type-specific getter methods
         GenerateTypeSpecificGetters(sb, membersByType, type);
@@ -217,45 +256,6 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         
         sb.AppendLine("    }");
         sb.AppendLine("}");
-    }
-
-    private static void GenerateDependencyDispatcher(
-        StringBuilder sb,
-        Dictionary<string, List<string>> propertyDependencies,
-        List<(ISymbol symbol, AttributeData attribute, string propName)> validMembers)
-    {
-        sb.AppendLine("        private void _DispatchDependentProperties(string propertyName)");
-        sb.AppendLine("        {");
-        sb.AppendLine("            switch (propertyName)");
-        sb.AppendLine("            {");
-        
-        // Build a map of field propName -> field symbol name for the switch
-        var fieldPropNameToSymbolName = validMembers
-            .Where(m => m.symbol is IFieldSymbol)
-            .ToDictionary(m => m.propName, m => m.symbol.Name);
-        
-        foreach (var kvp in propertyDependencies)
-        {
-            var fieldSymbolName = kvp.Key;
-            var dependentProperties = kvp.Value;
-            
-            // Find the propName for this field
-            var fieldPropName = fieldPropNameToSymbolName
-                .FirstOrDefault(x => x.Value == fieldSymbolName).Key;
-            
-            if (fieldPropName == null) continue;
-            
-            sb.AppendLine($"                case \"{fieldPropName}\":");
-            foreach (var dependentProp in dependentProperties)
-            {
-                sb.AppendLine($"                    _propertyChangedRelay.Dispatch(\"{dependentProp}\");");
-            }
-            sb.AppendLine("                    break;");
-        }
-        
-        sb.AppendLine("            }");
-        sb.AppendLine("        }");
-        sb.AppendLine();
     }
 
     private static void GenerateTypeSpecificGetters(
@@ -438,17 +438,37 @@ public class PropertyBindingGenerator : IIncrementalGenerator
 
             sb.AppendLine($"    {accessibility} void Set{propName}({typeName} value)");
             sb.AppendLine("    {");
-            sb.AppendLine($"        if (global::System.Collections.Generic.EqualityComparer<{typeName}>.Default.Equals({fieldName}, value)) return;");
+            sb.AppendLine($"        if (global::System.Collections.Generic.EqualityComparer\u003c{typeName}\u003e.Default.Equals({fieldName}, value)) return;");
             sb.AppendLine($"        {fieldName} = value;");
             sb.AppendLine();
-            sb.AppendLine("        // Only dispatch property name (receiver retrieves value via Get<T>)");
-            sb.AppendLine("        if (_properties?._propertyChangedRelay != null)");
+            sb.AppendLine("        if (_properties != null)");
             sb.AppendLine("        {");
-            sb.AppendLine($"            _properties._propertyChangedRelay.Dispatch(\"{propName}\");");
+            sb.AppendLine("            if (_properties._updateDepth > 0)");
+            sb.AppendLine($"                _properties.QueueChange(\"{propName}\");");
+            sb.AppendLine("            else");
+            sb.AppendLine($"                _properties.Dispatch(\"{propName}\");");
             sb.AppendLine("        }");
             sb.AppendLine("    }");
             sb.AppendLine();
         }
+
+        // Generate BeginUpdate / EndUpdate scope for batched updates
+        sb.AppendLine("    private sealed class BindingUpdateScope : global::System.IDisposable");
+        sb.AppendLine("    {");
+        sb.AppendLine($"        private readonly {className} _owner;");
+        sb.AppendLine($"        public BindingUpdateScope({className} owner) => _owner = owner;");
+        sb.AppendLine("        public void Dispose() => _owner._properties?.EndUpdate();");
+        sb.AppendLine("    }");
+        sb.AppendLine();
+        sb.AppendLine("    public global::System.IDisposable BeginUpdate()");
+        sb.AppendLine("    {");
+        sb.AppendLine("        if (_properties == null)");
+        sb.AppendLine("            _ = GetBindings;");
+        sb.AppendLine("        _properties.BeginUpdate();");
+        sb.AppendLine("        return new BindingUpdateScope(this);");
+        sb.AppendLine("    }");
+        sb.AppendLine();
+
 
         sb.AppendLine("}");
     }
@@ -474,18 +494,13 @@ public class PropertyBindingGenerator : IIncrementalGenerator
         }
 
         sb.AppendLine();
-        sb.AppendLine("        internal static global::System.Collections.Generic.List<string> keys = new();");
-        sb.AppendLine();
-        sb.AppendLine("        [global::System.Runtime.CompilerServices.ModuleInitializer]");
-        sb.AppendLine("        public static void Init()");
+        sb.AppendLine("        internal static readonly global::System.Collections.Generic.IReadOnlyList<string> keys = new[]");
         sb.AppendLine("        {");
-        
         foreach (var (_, _, propName) in validMembers)
         {
-            sb.AppendLine($"            keys.Add({propName});");
+            sb.AppendLine($"            {propName},");
         }
-        
-        sb.AppendLine("        }");
+        sb.AppendLine("        };");
         sb.AppendLine("    }");
         sb.AppendLine();
         sb.AppendLine("    public static global::System.Collections.Generic.IReadOnlyList<string> GetBindingKeys() => BindingKey.keys;");
