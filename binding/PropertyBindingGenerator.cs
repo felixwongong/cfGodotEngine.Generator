@@ -300,6 +300,29 @@ public class PropertyBindingGenerator : IIncrementalGenerator
             sb.AppendLine();
         }
 
+        // Generate _GetIEnumerable for collection fields
+        sb.AppendLine("        private bool _GetIEnumerable(string key, out global::System.Collections.IEnumerable value)");
+        sb.AppendLine("        {");
+        sb.AppendLine("            switch (key)");
+        sb.AppendLine("            {");
+
+        if (membersByType.TryGetValue("ienumerable", out var enumerableMembers))
+        {
+            foreach (var (symbol, _, propName) in enumerableMembers)
+            {
+                sb.AppendLine($"                case \"{propName}\":");
+                sb.AppendLine($"                    value = _owner.{symbol.Name};");
+                sb.AppendLine("                    return true;");
+            }
+        }
+
+        sb.AppendLine("                default:");
+        sb.AppendLine("                    value = default(global::System.Collections.IEnumerable);");
+        sb.AppendLine("                    return false;");
+        sb.AppendLine("            }");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+
         // Generate _GetObject for other types
         sb.AppendLine("        private bool _GetObject<T>(string key, out T value)");
         sb.AppendLine("        {");
@@ -350,7 +373,8 @@ public class PropertyBindingGenerator : IIncrementalGenerator
             ("string", "String"),
             ("bool", "Bool"),
             ("float", "Float"),
-            ("double", "Double")
+            ("double", "Double"),
+            ("System.Collections.IEnumerable", "IEnumerable")
         };
 
         bool first = true;
@@ -446,7 +470,10 @@ public class PropertyBindingGenerator : IIncrementalGenerator
             sb.AppendLine("            if (_properties._updateDepth > 0)");
             sb.AppendLine($"                _properties.QueueChange(\"{propName}\");");
             sb.AppendLine("            else");
-            sb.AppendLine($"                _properties.Dispatch(\"{propName}\");");
+            sb.AppendLine("            {");
+            sb.AppendLine($"                _properties.QueueChange(\"{propName}\");");
+            sb.AppendLine("                global::cfGodotEngine.Binding.BindingUpdateScheduler.Schedule(_properties.EndUpdate);");
+            sb.AppendLine("            }");
             sb.AppendLine("        }");
             sb.AppendLine("    }");
             sb.AppendLine();
@@ -517,6 +544,7 @@ public class PropertyBindingGenerator : IIncrementalGenerator
             "bool" => "bool",
             "float" => "float",
             "double" => "double",
+            "System.Collections.IEnumerable" => "ienumerable",
             _ => "object"
         };
     }
